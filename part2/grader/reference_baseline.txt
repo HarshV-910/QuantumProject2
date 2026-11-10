@@ -1,0 +1,11 @@
+Qiskit baseline: ON
+
+== Router: reference_router ==
+  [ PASS] ghz_n5         line5       swaps=3   2q=7    depth=8     qiskit_swaps=2
+  [ PASS] qft_n5_line    line5       swaps=13  2q=23   depth=16    qiskit_swaps=10
+  [ PASS] qft_n5_hhex    heavyhex27  swaps=11  2q=21   depth=18    qiskit_swaps=7
+  [ PASS] bv_n4          line5       swaps=8   2q=11   depth=10    qiskit_swaps=1
+  [ PASS] qaoa_n6_grid   grid2x3     swaps=2   2q=12   depth=19    qiskit_swaps=0
+  [ PASS] rand_n5        line5       swaps=0   2q=30   depth=30    qiskit_swaps=0
+  [ PASS] nearclif_n5    line5       swaps=0   2q=20   depth=36    qiskit_swaps=0
+  correctness gate: ALL PASS   |   total SWAPs = 37

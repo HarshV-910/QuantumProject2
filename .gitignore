@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Compiled libraries
+*.so
+*.o
+*.a
+
+# Editor
+.vscode/
+
+# Temporary files
+*.log
+.DS_Store
