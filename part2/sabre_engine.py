@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import insort, bisect_left
 from collections import defaultdict, deque
 
 from routing_common import Op, RoutingResult, neighbours, shortest_path
@@ -221,52 +222,66 @@ def _decay_penalty(recent_swaps, swap, decay_base):
     return total
 
 
-def score_candidate_swap(swap,front_layer,extended_set,mapping,adj,distance_table,recent_swaps,config,):
-    """Score as: (front_weight * ΔF + lookahead_weight * ΔE) + decay_penalty.
 
-    ΔF and ΔE are the total shortest-path distances of the ready front layer and
-    the dependency-based extended look-ahead set.  The decay term is a short-lived
-    penalty proportional to the recent activity of the candidate's physical
-    qubits.  It increases immediately when a physical qubit is reused in a newly
-    selected SWAP and then decays back toward zero when that qubit is not used
-    again, instead of growing forever with a monotone accumulator.
-    """
+def score_candidate_swap(swap,front_layer,extended_set,mapping,adj,distance_table,recent_swaps,config,):
+    """Calculate the exact SABRE score delta without copying MappingState."""
+
     front_weight = float(config.get("front_weight", 1.0))
     lookahead_weight = float(config.get("lookahead_weight", 0.5))
     decay_base = float(config.get("decay", 0.1))
 
+    a, b = swap
+
+    # Only logical qubits occupying these physical positions can move.
+    logical_a = mapping.physical_to_logical(a)
+    logical_b = mapping.physical_to_logical(b)
+
+    delta = 0.0
+
+    def accumulate(gates, weight):
+        nonlocal delta
+
+        if weight == 0:
+            return
+
+        for op in gates:
+            if not op.is_2q:
+                continue
+
+            q0, q1 = op.qubits
+
+            p0 = mapping.logical_to_physical(q0)
+            p1 = mapping.logical_to_physical(q1)
+
+            # Neither operand moves: this gate's distance is unchanged.
+            if q0 not in (logical_a, logical_b) and q1 not in (
+                logical_a, logical_b
+            ):
+                continue
+
+            old_distance = distance_table[p0][p1]
+
+            new_p0 = b if p0 == a else a if p0 == b else p0
+            new_p1 = b if p1 == a else a if p1 == b else p1
+
+            new_distance = distance_table[new_p0][new_p1]
+
+            delta += weight * (new_distance - old_distance)
+
+    accumulate(front_layer, front_weight)
+    accumulate(extended_set, lookahead_weight)
+
     decay_penalty = _decay_penalty(
-        recent_swaps, swap, decay_base
+        recent_swaps,
+        swap,
+        decay_base,
     )
 
-    def cost_for(ops, current_mapping):
-        return sum(
-            _gate_distance(op, current_mapping, adj, distance_table)
-            for op in ops
-            if op.is_2q
-        )
-
-    before = (
-        front_weight * cost_for(front_layer, mapping)
-        + lookahead_weight * cost_for(extended_set, mapping)
-    )
-
-    trial = MappingState(
-        mapping.n_logical,
-        mapping.n_physical,
-        mapping.snapshot_layout(),
-    )
-    trial.apply_swap(*swap)
-
-    after = (
-        front_weight * cost_for(front_layer, trial)
-        + lookahead_weight * cost_for(extended_set, trial)
-    )
-
-    return (after - before) + decay_penalty
+    return delta + decay_penalty
 
 
-def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
+
+def run_sabre_pass(ops,n,edges,initial_layout=None,config=None,*,diagnostics=None,progress_callback=None,progress_interval=1000):
     """Run the Group 1 core SABRE routing loop.
 
     The algorithm keeps a dependency-based front layer; when a ready 2Q gate is not
@@ -294,16 +309,95 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
     distance_table = build_distance_table(adj)
     preds, succs = build_dependency_dag(ops)
     processed = set()
+    remaining_predecessors = [len(predecessors) for predecessors in preds]
+    ready = [idx for idx, count in enumerate(remaining_predecessors) if count == 0]
     out = []
     recent_swaps = defaultdict(int)
+    seen_states = set()
+    routing_iterations = 0
+    inserted_swaps = 0
+
+    def mark_processed(idx):
+        processed.add(idx)
+        ready.pop(bisect_left(ready, idx))
+        for successor in succs[idx]:
+            remaining_predecessors[successor] -= 1
+            if remaining_predecessors[successor] == 0:
+                insort(ready, successor)
+
+    def report(event, **extra):
+        if diagnostics is not None:
+            diagnostics.update(
+                iterations=routing_iterations,
+                inserted_swaps=inserted_swaps,
+                processed_operations=len(processed),
+                total_operations=len(ops),
+                event=event,
+                **extra,
+            )
+        if progress_callback is not None:
+            progress_callback({
+                "iterations": routing_iterations,
+                "inserted_swaps": inserted_swaps,
+                "processed_operations": len(processed),
+                "total_operations": len(ops),
+                "event": event,
+                **extra,
+            })
 
     while len(processed) < len(ops):
-        ready = get_front_layer(ops, preds, processed)
-        if not ready:
+        routing_iterations += 1
+        ready_order = list(ready)
+        state = (
+            tuple(mapping.log_to_phys),
+            tuple(sorted(processed)),
+        )
+
+        if state in seen_states:
+            # The same mapping and same pending operations have appeared again.
+            # Force the earliest pending two-qubit gate toward adjacency.
+            target_idx = next(
+                (idx for idx in ready_order if ops[idx].is_2q),
+                None,
+            )
+
+            if target_idx is None:
+                raise RuntimeError("Repeated routing state without a pending 2Q gate")
+
+            op = ops[target_idx]
+            q0, q1 = op.qubits
+
+            p0 = mapping.logical_to_physical(q0)
+            p1 = mapping.logical_to_physical(q1)
+
+            path = shortest_path(adj, p0, p1)
+
+            # Move q0 along the path until it is adjacent to q1.
+            for i in range(len(path) - 2):
+                a, b = path[i], path[i + 1]
+
+                out.append(Op("SWAP", (a, b)))
+                inserted_swaps += 1
+
+                mapping.apply_swap(a, b)
+
+                _decay_recent_swaps(recent_swaps, decay_step)
+                recent_swaps[a] = recent_swaps.get(a, 0) + 1
+                recent_swaps[b] = recent_swaps.get(b, 0) + 1
+
+            # Re-evaluate the front layer with the new mapping.
+            seen_states.clear()
+            continue
+
+        seen_states.add(state)
+        if not ready_order:
             raise ValueError("dependency cycle: operations cannot be scheduled")
 
+        if progress_callback is not None and progress_interval and routing_iterations % int(progress_interval) == 0:
+            report("progress")
+
         executed_gate = False
-        for idx in ready:
+        for idx in ready_order:
             op = ops[idx]
             if not op.is_2q:
                 continue
@@ -312,7 +406,7 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
             p1 = mapping.logical_to_physical(q1)
             if p1 in adj.get(p0, set()):
                 out.append(Op(op.gate, (p0, p1), dict(op.params)))
-                processed.add(idx)
+                mark_processed(idx)
                 executed_gate = True
                 break
 
@@ -320,14 +414,14 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
             _decay_recent_swaps(recent_swaps, decay_step)
             continue
 
-        ready_2q_indices = [idx for idx in ready if ops[idx].is_2q]
+        ready_2q_indices = [idx for idx in ready_order if ops[idx].is_2q]
         if not ready_2q_indices:
-            idx = ready[0]
+            idx = ready_order[0]
             op = ops[idx]
             q = op.qubits[0]
             p = mapping.logical_to_physical(q)
             out.append(Op(op.gate, (p,), dict(op.params)))
-            processed.add(idx)
+            mark_processed(idx)
             _decay_recent_swaps(recent_swaps, decay_step)
             continue
 
@@ -368,12 +462,15 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
 
         a, b = best_swap
         out.append(Op("SWAP", (a, b)))
+        inserted_swaps += 1
         mapping.apply_swap(a, b)
         _decay_recent_swaps(recent_swaps, decay_step)
         recent_swaps[a] = recent_swaps.get(a, 0) + 1
         recent_swaps[b] = recent_swaps.get(b, 0) + 1
 
     final_layout = mapping.snapshot_layout()
+    if diagnostics is not None or progress_callback is not None:
+        report("complete")
     return RoutingResult(ops=out, initial=list(initial), final=final_layout)
 
 

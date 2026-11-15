@@ -1,0 +1,8 @@
+circuit,graph,n,legal,fidelity,pass,swaps,2q,depth,qiskit_swaps,qiskit_depth3
+ghz_n5,line5,5,True,1.0,True,3,7,8,2,6
+qft_n5_line,line5,5,True,1.0,True,15,25,20,10,14
+qft_n5_hhex,heavyhex27,5,True,1.0,True,11,21,18,7,16
+bv_n4,line5,5,True,1.0,True,5,8,10,1,6
+qaoa_n6_grid,grid2x3,6,True,1.0,True,3,13,19,0,17
+rand_n5,line5,5,True,1.0,True,0,30,30,0,30
+nearclif_n5,line5,5,True,1.0,True,0,20,36,0,18
