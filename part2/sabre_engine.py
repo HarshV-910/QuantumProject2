@@ -93,6 +93,31 @@ def _normalize_layout(layout, n_logical: int) -> list[int]:
         raise ValueError(f"layout length mismatch: expected {n_logical}, got {len(layout_list)}")
     return [int(v) for v in layout_list]
 
+def build_distance_table(adj):
+    """
+    Compute shortest-path distances between all physical qubits once.
+
+    The hardware coupling graph is fixed during routing, so these distances
+    can be reused for every candidate SWAP in this SABRE pass.
+    """
+    distances = {}
+
+    for source in adj:
+        dist = {source: 0}
+        queue = deque([source])
+
+        while queue:
+            u = queue.popleft()
+
+            for v in adj.get(u, ()):
+                if v not in dist:
+                    dist[v] = dist[u] + 1
+                    queue.append(v)
+
+        distances[source] = dist
+
+    return distances
+
 
 def build_dependency_dag(ops):
     """Build per-op predecessor/successor lists from qubit-wise ordering."""
@@ -144,18 +169,14 @@ def get_extended_set(ops, front_layer, processed, lookahead, succs=None):
     return [ops[idx] for idx in chosen[:lookahead]]
 
 
-def _gate_distance(op, mapping, adj):
+def _gate_distance(op, mapping, adj, distance_table):
     if not op.is_2q:
         return 0
+
     q0, q1 = op.qubits
     p0 = mapping.logical_to_physical(q0)
     p1 = mapping.logical_to_physical(q1)
-    if p1 in adj.get(p0, set()):
-        return 0
-    try:
-        return len(shortest_path(adj, p0, p1)) - 1
-    except ValueError:
-        return 10**9
+    return distance_table.get(p0, {}).get(p1, 10**9)
 
 
 def generate_candidate_swaps(front_layer_ops, mapping, adj):
@@ -200,7 +221,7 @@ def _decay_penalty(recent_swaps, swap, decay_base):
     return total
 
 
-def score_candidate_swap(swap, front_layer, extended_set, mapping, adj, recent_swaps, config):
+def score_candidate_swap(swap,front_layer,extended_set,mapping,adj,distance_table,recent_swaps,config,):
     """Score as: (front_weight * ΔF + lookahead_weight * ΔE) + decay_penalty.
 
     ΔF and ΔE are the total shortest-path distances of the ready front layer and
@@ -213,16 +234,35 @@ def score_candidate_swap(swap, front_layer, extended_set, mapping, adj, recent_s
     front_weight = float(config.get("front_weight", 1.0))
     lookahead_weight = float(config.get("lookahead_weight", 0.5))
     decay_base = float(config.get("decay", 0.1))
-    decay_penalty = _decay_penalty(recent_swaps, swap, decay_base)
 
-    def cost_for(ops):
-        return sum(_gate_distance(op, mapping, adj) for op in ops if op.is_2q)
+    decay_penalty = _decay_penalty(
+        recent_swaps, swap, decay_base
+    )
 
-    before = front_weight * cost_for(front_layer) + lookahead_weight * cost_for(extended_set)
-    trial = MappingState(mapping.n_logical, mapping.n_physical, mapping.snapshot_layout())
+    def cost_for(ops, current_mapping):
+        return sum(
+            _gate_distance(op, current_mapping, adj, distance_table)
+            for op in ops
+            if op.is_2q
+        )
+
+    before = (
+        front_weight * cost_for(front_layer, mapping)
+        + lookahead_weight * cost_for(extended_set, mapping)
+    )
+
+    trial = MappingState(
+        mapping.n_logical,
+        mapping.n_physical,
+        mapping.snapshot_layout(),
+    )
     trial.apply_swap(*swap)
-    after = front_weight * sum(_gate_distance(op, trial, adj) for op in front_layer if op.is_2q)
-    after += lookahead_weight * sum(_gate_distance(op, trial, adj) for op in extended_set if op.is_2q)
+
+    after = (
+        front_weight * cost_for(front_layer, trial)
+        + lookahead_weight * cost_for(extended_set, trial)
+    )
+
     return (after - before) + decay_penalty
 
 
@@ -251,6 +291,7 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
     initial = _normalize_layout(initial_layout, n)
     mapping = MappingState(n, n_phys, initial)
     adj = neighbours(edges)
+    distance_table = build_distance_table(adj)
     preds, succs = build_dependency_dag(ops)
     processed = set()
     out = []
@@ -303,7 +344,11 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
             p1 = mapping.logical_to_physical(q1)
             if p1 not in adj.get(p0, set()):
                 try:
-                    shortest_path(adj, p0, p1)
+                    if p1 not in distance_table.get(p0, {}):
+                        raise ValueError(
+                            f"required interaction between logical qubits {q0} and {q1} "
+                            f"(physical {p0} and {p1}) is disconnected from the coupling graph"
+                        )
                 except ValueError as exc:
                     raise ValueError(
                         f"required interaction between logical qubits {q0} and {q1} "
@@ -313,7 +358,7 @@ def run_sabre_pass(ops, n, edges, initial_layout=None, config=None):
         best_swap = None
         best_score = None
         for swap in candidate_swaps:
-            score = score_candidate_swap(swap, front_layer, extended_set, mapping, adj, recent_swaps, config)
+            score = score_candidate_swap(swap, front_layer, extended_set, mapping, adj, distance_table, recent_swaps, config)
             if best_score is None or score < best_score:
                 best_score = score
                 best_swap = swap
